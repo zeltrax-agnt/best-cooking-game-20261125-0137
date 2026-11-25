@@ -1,44 +1,86 @@
-// stations.js — the kitchen itself: where every counter stands, what it does,
-// and the cooking slots that tick while the chef runs elsewhere.
-// A station is a rect the chef cannot walk through plus an anchor point to stand at.
-export const STATIONS = [
-  { id: 'fridge',  name: 'Fridge',   x: 36,  y: 168, w: 150, h: 96,  anchor: { x: 111, y: 300 }, hint: '1 bun · 2 patty · 5 cheese · 6 pot' },
-  { id: 'produce', name: 'Produce',  x: 206, y: 168, w: 210, h: 96,  anchor: { x: 311, y: 300 }, hint: '3 lettuce · 4 tomato' },
-  { id: 'board',   name: 'Chopping Board', x: 36, y: 470, w: 190, h: 96, anchor: { x: 131, y: 450 }, hint: 'hold E to chop' },
-  { id: 'grill',   name: 'Grill',    x: 908, y: 168, w: 170, h: 96,  anchor: { x: 993, y: 300 }, hint: 'E: place / take patty' },
-  { id: 'stove',   name: 'Stove',    x: 1098, y: 168, w: 146, h: 96, anchor: { x: 1171, y: 300 }, hint: 'E: place pot / take soup' },
-  { id: 'island',  name: 'Assembly Counter', x: 470, y: 400, w: 340, h: 110, anchor: { x: 640, y: 372 }, hint: 'E: add to plate · pick up plate' },
-  { id: 'window',  name: 'Serving Window', x: 908, y: 470, w: 336, h: 96, anchor: { x: 1076, y: 450 }, hint: 'E: serve the dish' },
-  { id: 'bin',     name: 'Bin',      x: 36,  y: 620, w: 110, h: 64,  anchor: { x: 91,  y: 600 }, hint: 'E: throw away' },
-];
+// stations.js — the four workstations: chop, grill, simmer, fry. A raw
+// ingredient goes in, a timer runs, a prepared ingredient comes out — unless
+// the chef forgets it and it burns.
 
-export function stationById(id) {
-  return STATIONS.find((s) => s.id === id);
+import { INGREDIENT_BY_ID, STATIONS } from './data.js';
+import { burnItem, setMessage } from './state.js';
+
+// How long a finished item may sit before it burns (seconds).
+export const BURN_AFTER = 6;
+
+export function stationAccepts(stationId, ingredientId) {
+  const ing = INGREDIENT_BY_ID[ingredientId];
+  return !!ing && ing.station === stationId;
 }
 
-// Cooking slots: the grill holds two patties, the stove one pot. Each slot ticks
-// on its own, so the chef can start a patty, chop lettuce, and come back for it.
-export function createKitchenState() {
-  return {
-    grill: [
-      { item: null, progress: 0, done: false, burnt: false, announced: false },
-      { item: null, progress: 0, done: false, burnt: false, announced: false },
-    ],
-    stove: [
-      { item: null, progress: 0, done: false, burnt: false, announced: false },
-    ],
-    plate: [],          // finished items stacked on the assembly counter
-    chopProgress: 0,   // 0..1 while the chef holds E at the board
-    chopItem: null,    // the raw item currently being chopped
-  };
-}
-
-// The nearest station whose anchor the chef can reach, or null.
-export function nearestStation(chefX, chefY, range) {
-  let best = null, bestD = Infinity;
-  for (const s of STATIONS) {
-    const d = Math.hypot(chefX - s.anchor.x, chefY - s.anchor.y);
-    if (d < bestD) { bestD = d; best = s; }
+// Start cooking the held raw ingredient at a station. Returns a message for
+// the chef, or null when the station cannot take it.
+export function startStation(state, stationId) {
+  const station = state.stations[stationId];
+  const hand = state.hand;
+  if (!hand || hand.kind !== 'raw') return 'Pick up a raw ingredient first (click a pantry bin).';
+  if (station.busy) return `${STATIONS[stationId].name} is busy — wait for it to finish.`;
+  if (!stationAccepts(stationId, hand.id)) {
+    return `${INGREDIENT_BY_ID[hand.id].name} does not go on the ${STATIONS[stationId].name} — it needs the ${STATIONS[INGREDIENT_BY_ID[hand.id].station].name}.`;
   }
-  return bestD <= range ? best : null;
+  station.busy = {
+    id: hand.id,
+    progress: 0,
+    seconds: STATIONS[stationId].seconds,
+    done: false,
+    doneFor: 0,
+    burnt: false,
+  };
+  state.hand = null;
+  return null;
+}
+
+// Tick every station: advance progress, mark done, burn what sits too long.
+export function tickStations(state, dt) {
+  const events = [];
+  for (const [id, station] of Object.entries(state.stations)) {
+    const job = station.busy;
+    if (!job) continue;
+    if (!job.done) {
+      job.progress += dt / job.seconds;
+      if (job.progress >= 1) {
+        job.progress = 1;
+        job.done = true;
+        job.doneFor = 0;
+        events.push({ type: 'stationDone', station: id, ingredient: job.id });
+      }
+    } else if (!job.burnt) {
+      job.doneFor += dt;
+      if (job.doneFor >= BURN_AFTER) {
+        job.burnt = true;
+        burnItem(state, id, job.id);
+        events.push({ type: 'burnt', station: id, ingredient: job.id });
+      }
+    }
+  }
+  return events;
+}
+
+// Click a station: collect a finished item into the hand, or clear a burnt one.
+export function collectStation(state, stationId) {
+  const station = state.stations[stationId];
+  const job = station.busy;
+  if (!job) return 'Nothing cooking here yet.';
+  if (job.burnt) {
+    station.busy = null;
+    setMessage(state, 'Cleared the burnt food. Keep an eye on the timers!', 2);
+    return null;
+  }
+  if (!job.done) {
+    return `Still ${STATIONS[stationId].gerund.toLowerCase()} — ${Math.ceil((1 - job.progress) * job.seconds)}s to go.`;
+  }
+  if (state.hand) return 'Your hands are full — place what you hold first.';
+  state.hand = { kind: 'done', id: job.id };
+  station.busy = null;
+  return null;
+}
+
+// The station a held raw ingredient belongs to, for the hint line.
+export function homeStationFor(ingredientId) {
+  return INGREDIENT_BY_ID[ingredientId]?.station ?? null;
 }

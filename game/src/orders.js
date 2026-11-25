@@ -1,70 +1,113 @@
-// orders.js — the order board: what customers want, how long they will wait,
-// and what a served dish is worth. Pressure grows: more orders, less patience.
-import { RECIPES, orderPatience, spawnInterval } from './config.js';
+// orders.js — the order board: customers arrive, wait with a draining
+// patience meter, and leave happy (served) or angry (walked out).
 
-let nextOrderId = 1;
+import { INGREDIENT_BY_ID, RECIPE_BY_ID, pickFrom } from './data.js';
+import { availableRecipes, dayConfig, loseOrder } from './state.js';
 
-export class Orders {
-  constructor() {
-    this.list = [];
-    this.spawnTimer = 6; // first order arrives a few seconds in
-    this.elapsed = 0;
-    this.rush = false;
+const CUSTOMERS = [
+  'Mara', 'Theo', 'Priya', 'Jonas', 'Aiko', 'Felix', 'Nadia', 'Omar',
+  'Lena', 'Ravi', 'Sofia', 'Hugo', 'Ines', 'Marco', 'Yuki', 'Dario',
+];
+
+// A customer portrait is just a warm circle, initials and a hat colour —
+// original art, drawn fresh every frame, no borrowed faces.
+const HAT_COLORS = ['#e2572b', '#2f5d6e', '#7bc043', '#c98f2d', '#8a5a9e', '#d9392b'];
+
+export function spawnOrder(state, forcedRecipeId = null) {
+  const cfg = dayConfig(state);
+  const recipes = availableRecipes(state);
+  if (recipes.length === 0) return null;
+  const recipe = forcedRecipeId
+    ? RECIPE_BY_ID[forcedRecipeId]
+    : pickFrom(state.rng, recipes);
+  const patience = cfg.patience * (0.85 + state.rng() * 0.3);
+  const order = {
+    id: state.nextOrderId++,
+    recipe,
+    customer: pickFrom(state.rng, CUSTOMERS),
+    hat: pickFrom(state.rng, HAT_COLORS),
+    patience,
+    patienceMax: patience,
+    bornAt: state.elapsed,
+  };
+  state.orders.push(order);
+  if (state.selectedOrderId === null) state.selectedOrderId = order.id;
+  return order;
+}
+
+// One tick of the order board: spawn on schedule, drain patience, drop the
+// customers who waited too long. Returns events for sound + message hooks.
+export function tickOrders(state, dt) {
+  const events = [];
+  if (state.phase !== 'playing') return events;
+  const cfg = dayConfig(state);
+  const rush = state.timeLeft <= 30;
+  state.spawnTimer -= dt;
+  if (state.spawnTimer <= 0 && state.orders.length < cfg.maxOrders) {
+    const order = spawnOrder(state);
+    if (order) events.push({ type: 'newOrder', order });
+    state.spawnTimer = cfg.spawnEvery * (rush ? 0.55 : 1) * (0.8 + state.rng() * 0.4);
   }
-
-  reset() {
-    this.list = [];
-    this.spawnTimer = 6;
-    this.elapsed = 0;
-    this.rush = false;
-  }
-
-  update(dt, onExpire) {
-    this.elapsed += dt;
-    this.spawnTimer -= dt;
-    const maxOrders = this.rush ? 4 : 3;
-    if (this.spawnTimer <= 0 && this.list.length < maxOrders) {
-      this.addOrder();
-      this.spawnTimer = spawnInterval(this.elapsed, this.rush);
+  for (const order of [...state.orders]) {
+    order.patience -= dt;
+    if (order.patience <= 0) {
+      state.orders = state.orders.filter((o) => o.id !== order.id);
+      if (state.selectedOrderId === order.id) {
+        state.selectedOrderId = state.orders[0]?.id ?? null;
+      }
+      if (state.plate.targetOrderId === order.id) {
+        state.plate = { items: [], targetOrderId: null };
+      }
+      loseOrder(state, order);
+      events.push({ type: 'lostOrder', order });
     }
-    for (const o of this.list) o.patience -= dt;
-    const expired = this.list.filter((o) => o.patience <= 0);
-    if (expired.length) {
-      this.list = this.list.filter((o) => o.patience > 0);
-      for (const o of expired) onExpire(o);
-    }
   }
+  return events;
+}
 
-  addOrder(recipe = null) {
-    const pick = recipe ?? RECIPES[Math.floor(Math.random() * RECIPES.length)];
-    const patience = orderPatience(this.elapsed);
-    this.list.push({
-      id: nextOrderId++,
-      recipe: pick,
-      patience,
-      patienceMax: patience,
-      born: this.elapsed,
-    });
-    return this.list[this.list.length - 1];
-  }
+// The plate's target order: the selected ticket, or the first order whose
+// recipe still needs the item being placed.
+export function orderForPlate(state) {
+  return state.orders.find((o) => o.id === state.selectedOrderId) ?? state.orders[0] ?? null;
+}
 
-  // The order a plate (or a lone soup) can satisfy, oldest first.
-  matchFor(items) {
-    const sorted = [...items].sort();
-    for (const o of this.list) {
-      const need = [...o.recipe.needs].sort();
-      if (need.length === sorted.length && need.every((n, i) => n === sorted[i])) return o;
-    }
-    return null;
+// Does the plate (plus this one item) still match its target recipe?
+export function plateAccepts(state, ingredientId) {
+  const order = orderForPlate(state);
+  if (!order) return false;
+  const wanted = [...order.recipe.items];
+  const placed = [...state.plate.items];
+  const idx = wanted.indexOf(ingredientId);
+  if (idx === -1) return false;
+  wanted.splice(idx, 1);
+  for (const item of placed) {
+    const j = wanted.indexOf(item);
+    if (j === -1) return false;
+    wanted.splice(j, 1);
   }
+  return true;
+}
 
-  remove(order) {
-    this.list = this.list.filter((o) => o.id !== order.id);
-  }
+export function plateIsComplete(state) {
+  const order = orderForPlate(state);
+  if (!order) return false;
+  const wanted = [...order.recipe.items].sort();
+  const placed = [...state.plate.items].sort();
+  return wanted.length === placed.length && wanted.every((v, i) => v === placed[i]);
+}
 
-  // How much of a dish's price the customer still pays for a slow serve.
-  tipFor(order) {
-    const frac = Math.max(0, order.patience / order.patienceMax);
-    return Math.round(order.recipe.price * 0.6 * frac);
+// What the ticket still needs, for the "missing" dots on the order board.
+export function missingItems(state, order) {
+  const wanted = [...order.recipe.items];
+  const isTarget = state.plate.targetOrderId === order.id || state.selectedOrderId === order.id;
+  const placed = isTarget ? state.plate.items : [];
+  for (const item of placed) {
+    const j = wanted.indexOf(item);
+    if (j !== -1) wanted.splice(j, 1);
   }
+  return wanted;
+}
+
+export function ingredientLabel(id) {
+  return INGREDIENT_BY_ID[id]?.name ?? id;
 }
